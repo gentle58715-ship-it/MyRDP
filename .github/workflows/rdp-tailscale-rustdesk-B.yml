@@ -1,0 +1,259 @@
+name: Secure temporary Windows RDP (B)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "Session length in minutes (5-330)"
+        required: false
+        default: "300"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: secure-rdp
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 340
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+      RDP_USER: PrivateRemote
+
+    steps:
+      - name: Validate secrets and runtime
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) { throw "Missing repository secret: TS_AUTHKEY" }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Missing repository secret: RDP_PASSWORD" }
+          if ([string]::IsNullOrWhiteSpace($env:BACKUP_PASSWORD)) { throw "Missing repository secret: BACKUP_PASSWORD" }
+
+          $validRdpPassword =
+            $env:RDP_PASSWORD.Length -ge 12 -and
+            $env:RDP_PASSWORD.Length -le 64 -and
+            $env:RDP_PASSWORD -cmatch '[A-Z]' -and
+            $env:RDP_PASSWORD -cmatch '[a-z]' -and
+            $env:RDP_PASSWORD -match '\d' -and
+            $env:RDP_PASSWORD -match '[^A-Za-z0-9]' -and
+            $env:RDP_PASSWORD.IndexOf($env:RDP_USER, [StringComparison]::OrdinalIgnoreCase) -lt 0
+
+          if (-not $validRdpPassword) {
+            throw "RDP_PASSWORD must be 12-64 characters, include uppercase, lowercase, number and symbol, and must not contain PrivateRemote."
+          }
+
+          Write-Output "::add-mask::$env:TS_AUTHKEY"
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
+          Write-Output "::add-mask::$env:BACKUP_PASSWORD"
+          Write-Output "::add-mask::$env:GH_TOKEN"
+
+          $raw = "${{ inputs.runtime_minutes }}"
+          $minutes = 300
+          if ($raw -match '^\d+$') { $minutes = [int]$raw }
+          if ($minutes -lt 5) { $minutes = 5 }
+          if ($minutes -gt 330) { $minutes = 330 }
+          "RUNTIME_MINUTES=$minutes" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install and connect Tailscale
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) {
+            winget install --id Tailscale.Tailscale --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          }
+          if (-not (Test-Path $tailscale)) { throw "Tailscale installation failed" }
+
+          $hostname = "gha-rdp-${{ github.run_id }}-B"
+          & $tailscale up --authkey="$env:TS_AUTHKEY" --hostname="$hostname" --accept-dns=true --reset
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale connection failed" }
+
+          $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) { throw "No Tailscale IPv4 address" }
+          "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale device: $hostname"
+          Write-Host "Connect to RDP at: $ip"
+
+      - name: Create private RDP account
+        run: |
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
+          if ($existing) {
+            Set-LocalUser -Name $env:RDP_USER -Password $securePassword -AccountNeverExpires
+            Enable-LocalUser -Name $env:RDP_USER
+          } else {
+            New-LocalUser -Name $env:RDP_USER -Password $securePassword -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "Private RDP over Tailscale" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Private RDP over Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Profile Any | Out-Null
+
+          Write-Host "RDP is ready through Tailscale only."
+          Write-Host "Username: .\$env:RDP_USER"
+          Write-Host "Full username: $env:COMPUTERNAME\$env:RDP_USER"
+          Write-Host "Address: $env:TAILSCALE_IP"
+
+      - name: Restore latest encrypted backup
+        run: |
+          $profile = "C:\Users\$env:RDP_USER"
+          @("Desktop", "Documents", "Downloads") | ForEach-Object {
+            New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+          }
+
+          $restoreUrl = "https://raw.githubusercontent.com/${{ github.repository }}/rdp-backups/rdp-backup.7z"
+          $encrypted = "$env:RUNNER_TEMP\rdp-backup-restore.7z"
+          try {
+            Invoke-WebRequest -Uri $restoreUrl -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile $encrypted -ErrorAction Stop
+          } catch {
+            Write-Host "No previous branch backup found; starting with empty folders."
+            exit 0
+          }
+
+          & "C:\Program Files\7-Zip\7z.exe" x $encrypted "-p$env:BACKUP_PASSWORD" "-o$profile" -y
+          if ($LASTEXITCODE -ne 0) { throw "Backup password is incorrect or archive is damaged" }
+          Write-Host "Latest encrypted backup restored from rdp-backups branch."
+
+      - name: Keep session available with auto backup
+        run: |
+          function Save-EncryptedBackup {
+            param([string] $Reason)
+
+            $profile = "C:\Users\$env:RDP_USER"
+            @("Desktop", "Documents", "Downloads") | ForEach-Object {
+              New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+            }
+
+            $archive = "$env:RUNNER_TEMP\rdp-backup.7z"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+
+            Push-Location $profile
+            try {
+              & "C:\Program Files\7-Zip\7z.exe" a -t7z $archive "Desktop" "Documents" "Downloads" "-p$env:BACKUP_PASSWORD" -mhe=on -mx=5
+              if ($LASTEXITCODE -ne 0) { throw "Could not create encrypted backup" }
+            } finally {
+              Pop-Location
+            }
+
+            $work = "$env:RUNNER_TEMP\rdp-backup-branch"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git clone --depth 1 --branch rdp-backups "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              git clone --depth 1 "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work
+              if ($LASTEXITCODE -ne 0) { throw "Could not clone repository for backup" }
+              Push-Location $work
+              try {
+                git checkout --orphan rdp-backups
+                git rm -rf . 2>$null
+              } finally {
+                Pop-Location
+              }
+            }
+
+            Copy-Item $archive (Join-Path $work "rdp-backup.7z") -Force
+            $stamp = (Get-Date).ToUniversalTime().ToString("u")
+            @("Last backup reason: $Reason", "Workflow run: ${{ github.run_id }}", "Updated at UTC: $stamp") | Set-Content -Path (Join-Path $work "README.txt") -Encoding utf8
+
+            Push-Location $work
+            try {
+              git add rdp-backup.7z README.txt
+              git commit -m "Update encrypted RDP backup ($Reason)" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                git push origin rdp-backups
+                if ($LASTEXITCODE -ne 0) { throw "Could not push encrypted backup" }
+                Write-Host "Encrypted backup saved to rdp-backups branch ($Reason)."
+              } else {
+                Write-Host "No backup changes to push ($Reason)."
+              }
+            } finally {
+              Pop-Location
+            }
+          }
+
+          $end = (Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
+          $nextBackup = (Get-Date).AddMinutes(15)
+          Save-EncryptedBackup -Reason "startup"
+
+          while ((Get-Date) -lt $end) {
+            Write-Host ("Session active; ends near " + $end.ToString("u"))
+            if ((Get-Date) -ge $nextBackup) {
+              Save-EncryptedBackup -Reason "auto-15-min"
+              $nextBackup = (Get-Date).AddMinutes(15)
+            }
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Create final encrypted backup
+        if: always()
+        run: |
+          function FinalBackup {
+            $profile = "C:\Users\$env:RDP_USER"
+            @("Desktop", "Documents", "Downloads") | ForEach-Object {
+              New-Item -ItemType Directory -Path (Join-Path $profile $_) -Force | Out-Null
+            }
+
+            $archive = "$env:RUNNER_TEMP\rdp-backup.7z"
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+
+            Push-Location $profile
+            try {
+              & "C:\Program Files\7-Zip\7z.exe" a -t7z $archive "Desktop" "Documents" "Downloads" "-p$env:BACKUP_PASSWORD" -mhe=on -mx=5
+              if ($LASTEXITCODE -ne 0) { throw "Could not create encrypted backup" }
+            } finally {
+              Pop-Location
+            }
+
+            $work = "$env:RUNNER_TEMP\rdp-backup-branch-final"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            git clone --depth 1 --branch rdp-backups "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              git clone --depth 1 "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" $work
+              if ($LASTEXITCODE -ne 0) { throw "Could not clone repository for backup" }
+              Push-Location $work
+              try {
+                git checkout --orphan rdp-backups
+                git rm -rf . 2>$null
+              } finally {
+                Pop-Location
+              }
+            }
+
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            Copy-Item $archive (Join-Path $work "rdp-backup.7z") -Force
+            $stamp = (Get-Date).ToUniversalTime().ToString("u")
+            @("Last backup reason: final", "Workflow run: ${{ github.run_id }}", "Updated at UTC: $stamp") | Set-Content -Path (Join-Path $work "README.txt") -Encoding utf8
+            Push-Location $work
+            try {
+              git add rdp-backup.7z README.txt
+              git commit -m "Update encrypted RDP backup (final)" 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                git push origin rdp-backups
+                if ($LASTEXITCODE -ne 0) { throw "Could not push encrypted backup" }
+              }
+            } finally {
+              Pop-Location
+            }
+          }
+
+          FinalBackup
+
+      - name: Disconnect Tailscale
+        if: always()
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tailscale) { & $tailscale logout }
